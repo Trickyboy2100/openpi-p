@@ -15,19 +15,32 @@ class VideoSaver(_subscriber.Subscriber):
         self._out_dir = out_dir
         self._images: list[np.ndarray] = []
         self._subsample = subsample
+        # 这里记录一条轨迹里每一步的 state / action
+        self._buffer: list[dict[str, np.ndarray]] = []
 
     @override
     def on_episode_start(self) -> None:
         self._images = []
+        self._buffer = []   # 新增：每个 episode 开头清空 buffer
 
     @override
     def on_step(self, observation: dict, action: dict) -> None:
+        # 存视频帧
         im = observation["images"]["cam_high"]  # [C, H, W]
-        im = np.transpose(im, (1, 2, 0))  # [H, W, C]
+        im = np.transpose(im, (1, 2, 0))       # [H, W, C]
         self._images.append(im)
+
+        # 存轨迹（先不管 reward / done，以后要的话再改 runtime）
+        self._buffer.append(
+            {
+                "state": observation["state"].copy(),
+                "action": action["actions"].copy(),
+            }
+        )
 
     @override
     def on_episode_end(self) -> None:
+        # ------ 存视频 ------
         existing = list(self._out_dir.glob("out_[0-9]*.mp4"))
         next_idx = max([int(p.stem.split("_")[1]) for p in existing], default=-1) + 1
         out_path = self._out_dir / f"out_{next_idx}.mp4"
@@ -38,3 +51,15 @@ class VideoSaver(_subscriber.Subscriber):
             [np.asarray(x) for x in self._images[:: self._subsample]],
             fps=50 // max(1, self._subsample),
         )
+
+        # ------ 存轨迹 ------
+        if self._buffer:  # 防止空 episode
+            states = np.stack([s["state"] for s in self._buffer])    # [T, state_dim]
+            actions = np.stack([s["action"] for s in self._buffer])  # [T, act_dim]
+
+            idx = len(list(self._out_dir.glob("traj_*.npz")))
+            path = self._out_dir / f"traj_{idx:04d}.npz"
+            np.savez(path, state=states, action=actions)
+
+        # 清理
+        self._buffer = []
