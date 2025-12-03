@@ -66,7 +66,9 @@ class AlohaSimEnvironment(_environment.Environment):
         # 将 OpenPI 的动作格式转换为 gym_aloha 所需的格式并执行动作
         gym_obs, reward, terminated, truncated, info = self._gym.step(action["actions"])
         self._last_obs = self._convert_observation(gym_obs)  # type: ignore
-        self._done = truncated  # or terminated
+        # gym_aloha marks success via reward==4 and sets terminated; truncated is time-limit.
+        is_success = info.get("is_success", False) if info else False
+        self._done = bool(truncated) or bool(terminated) or bool(is_success)
         # 累积奖励，便于 RL 统计；如果更合适取 max，可自行调整
         self._episode_reward += reward
         return reward, info

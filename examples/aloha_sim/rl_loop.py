@@ -129,17 +129,18 @@ def make_policy(checkpoint_path: str, config_name: str):
     return policy_fn
 
 
-def compute_reward(pi_obs: Dict[str, Any], info: Dict[str, Any], action: np.ndarray) -> float:
-    """Task-aware reward placeholder.
+def compute_reward(pi_obs: Dict[str, Any], info: Dict[str, Any], action: np.ndarray, env_reward: float = 0.0) -> float:
+    """Task-aware reward placeholder (Stage 1).
 
     If env exposes task info (e.g., cube/goal positions or success flags), use them here.
-    Currently env obs has only state/images, so we fallback to:
-      - dist_term: negative state norm (proxy; TODO replace with task distance)
-      - act_pen: small action penalty for smoothness
-      - success_bonus: if info has success flag
+    For gym_aloha transfer cube, available signals:
+      - env_reward in {0..4} (contact-based staging; 4 = successful transfer)
+      - info["is_success"] when reward == 4
+    We also keep small shaping on state norm and action magnitude.
     """
-    dist_term = -float(np.linalg.norm(pi_obs["state"]))
+    dist_term = -float(np.linalg.norm(pi_obs["state"])) * 0.1  # mild shaping; adjust as needed
     act_pen = -float(np.linalg.norm(action)) * 0.01
+    env_term = float(env_reward)  # use env's discrete reward directly
     success_bonus = 0.0
     if info is not None:
         for k in ("success", "is_success", "done_success"):
@@ -147,8 +148,9 @@ def compute_reward(pi_obs: Dict[str, Any], info: Dict[str, Any], action: np.ndar
                 success_bonus = 5.0
                 break
         # If env later provides a distance metric, add it here:
-        # if "dist_to_goal" in info: dist_term = -float(info["dist_to_goal"])
-    return dist_term + act_pen + success_bonus
+        if "dist_to_goal" in info:
+            dist_term = -float(info["dist_to_goal"])
+    return env_term + dist_term + act_pen + success_bonus
 
 
 def rollout(env: AlohaSimEnvironment, policy_fn, episode_steps: int = 200) -> float:
@@ -164,15 +166,16 @@ def rollout(env: AlohaSimEnvironment, policy_fn, episode_steps: int = 200) -> fl
 
     pi_obs0 = convert_env_obs(obs0)
     action0 = policy_fn(pi_obs0)
-    r0 = compute_reward(pi_obs0, {}, action0)
+    env_r0, info0 = env.apply_action({"actions": action0})
+    r0 = compute_reward(pi_obs0, info0 or {}, action0, env_reward=env_r0)
     rewards.append(r0)
     total_reward += r0
-    env.apply_action({"actions": action0})
     print(
         f"[{datetime.now().isoformat()}] step=0 "
         f"state_norm={np.linalg.norm(pi_obs0['state']):.3f} "
         f"action_min={action0.min():.3f} action_max={action0.max():.3f} "
-        f"action_mean={action0.mean():.3f} reward={r0:.3f}"
+        f"action_mean={action0.mean():.3f} reward={r0:.3f} "
+        f"env_r={env_r0:.3f} info_keys={list(info0.keys()) if info0 else []}"
     )
 
     for t in tqdm(range(1, episode_steps), desc="Rollout", ncols=100):
@@ -186,8 +189,10 @@ def rollout(env: AlohaSimEnvironment, policy_fn, episode_steps: int = 200) -> fl
                 f"action_min={action.min():.3f} action_max={action.max():.3f} "
                 f"action_mean={action.mean():.3f}"
             )
-        env.apply_action({"actions": action})
-        r = compute_reward(pi_obs, {}, action)
+        env_r, info = env.apply_action({"actions": action})
+        if info and t % 20 == 0:
+            print(f"[{datetime.now().isoformat()}] info keys: {list(info.keys())}")
+        r = compute_reward(pi_obs, info or {}, action, env_reward=env_r)
         rewards.append(r)
         total_reward += r
         if env.is_episode_complete():
@@ -257,4 +262,10 @@ Use this as a starting point to:
 1) Plug in task-specific reward/success signals (needs env info: cube/goal positions or success flags).
 2) Add a trajectory buffer + update_policy skeleton for on-policy RL (tiny model first, then LoRA).
 3) Iterate on action scaling/clipping if sim instability appears.
+
+Env signals (from gym_aloha/AlohaTransferCube-v0):
+- Observation from env wrapper includes only images (top cam) and agent_pos (qpos of 14 dof).
+- Env internal reward: discrete 0..4 based on contacts (0 idle, 1 right touch, 2 right lifted, 3 left touch, 4 successful transfer).
+- Env info: {"is_success": reward == 4}. Termination in gym_aloha is tied to reward==4 (terminated); wrapper now treats success/terminated/truncated as done.
+=> We lack explicit cube/goal poses; for task-aware reward we can use env_reward and success flag. Distances would need env_state wiring if added later.
 """

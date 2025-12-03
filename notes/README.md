@@ -1,4 +1,5 @@
 # Personal Notes for ALOHA-sim π-RL (timestamp: 2025-12-03T20:58:07+08:00)
+# Update: 2025-12-04T01:01:03+08:00
 
 ## Repo / Env
 - Path: `~/Gitclones/openpi`
@@ -24,10 +25,11 @@
 
 ## RL loop (current state)
 - File: `examples/aloha_sim/rl_loop.py`
-- Does: env reset → obs convert → policy forward (BC checkpoint) → action safety (nan_to_num + clip) → apply_action → toy reward logging.
-- Reward placeholder: `-(||state|| + 0.01*||action||)`, optional success_bonus if info has success flag.
-- Logging: timestep logs every 10 steps with state/action stats; episode reward stats printed.
-- Not implemented yet: trajectory buffer, advantage/value head, policy updates (PPO/REINFORCE), true task reward (needs env goal/success info).
+- Does: env reset → obs convert → policy forward (BC checkpoint) → action safety (nan_to_num + clip) → apply_action → reward logging.
+- Reward (task-aware placeholder): env_reward (0–4 contact-based), light state_norm shaping (−0.1‖state‖), action penalty (−0.01‖a‖), success_bonus=5 if info success.
+- Env info: gym_aloha transfer cube uses reward stages; info has `is_success` when reward==4; obs only has top camera + agent_pos (qpos). No explicit goal/cube pose exposed.
+- Logging: every 10 steps with timestamp; episode reward stats printed.
+- Not implemented yet: trajectory buffer, advantage/value head, policy updates (PPO/REINFORCE), explicit distance-based reward (would require exposing env_state/goal).
 - Run example (FSDP LoRA):
   ```bash
   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl XLA_PYTHON_CLIENT_PREALLOCATE=false \
@@ -45,3 +47,4 @@
 - Add minimal RL skeleton: trajectory buffer, optional value/residual head, update_policy (e.g., REINFORCE) on tiny model first.
 - Reduce episode length when debugging to cut compile/run time (e.g., 50–100 steps).
 - If pushing to origin fails (network), retry from a networked terminal: `git push origin HEAD`.
+- Consider modifying gym_aloha to expose env_state (BOX_POSE) or goal/cube pose for distance shaping; current reward is contact-based only (0..4).
