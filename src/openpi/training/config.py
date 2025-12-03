@@ -910,6 +910,7 @@ _CONFIGS = [
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
+    ########20251129moded
     TrainConfig(
         name="pi0_aloha_sim",
         model=pi0_config.Pi0Config(),
@@ -919,15 +920,153 @@ _CONFIGS = [
             use_delta_joint_actions=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
+        batch_size = 4,
+        num_train_steps=500,
     ),
+
+    ########original
+    #TrainConfig(
+    #    name="pi0_aloha_sim",
+    #    model=pi0_config.Pi0Config(),
+    #    data=LeRobotAlohaDataConfig(
+    #        repo_id="lerobot/aloha_sim_transfer_cube_human",
+    #        default_prompt="Transfer cube",
+    #        use_delta_joint_actions=False,
+    #    ),
+    #    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/#
+    #checkpoints/pi0_base/params"),
+    #    num_train_steps=20_000,
+    #),
+    # A tiny-from-scratch variant for local debugging; uses dummy paligemma/action expert to reduce size.
+    TrainConfig(
+        name="pi0_aloha_sim_tiny",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=20,
+            max_token_len=48,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),  # train from scratch
+        batch_size=1,
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+    # Same tiny model but batch size 4 for multi-GPU sharding tests.
+    TrainConfig(
+        name="pi0_aloha_sim_tiny_b4",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=20,
+            max_token_len=48,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        batch_size=4,  # divisible by 4 GPUs -> per-device batch 1
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+    # Mid-size test: gemma_300m backbone; keep horizon conservative for memory.
+    TrainConfig(
+        name="pi0_aloha_sim_small300",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            action_horizon=20,
+            max_token_len=48,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),  # train from scratch
+        batch_size=1,
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+    # LoRA fine-tune variant: gemma_300m_lora backbones, conservative horizon/token for memory.
+    TrainConfig(
+        name="pi0_aloha_sim_300m_lora_h16",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_300m_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=16,
+            max_token_len=32,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),  # start from scratch to avoid shape mismatch
+        batch_size=1,
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+    # 20251203 Optimal
+    # LoRA + FSDP test: smaller horizon/token, shard across 4 devices if available.
+    TrainConfig(
+        name="pi0_aloha_sim_300m_lora_h12_fsdp",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_300m_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=12,
+            max_token_len=24,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        batch_size=4,  # per-device batch 1 on 4 GPUs
+        fsdp_devices=4,
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+    # Smaller horizon/token variant to further cut memory.
+    TrainConfig(
+        name="pi0_aloha_sim_small300_h16",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            action_horizon=16,
+            max_token_len=32,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        batch_size=1,
+        num_train_steps=200,
+        save_interval=50,
+        wandb_enabled=False,
+    ),
+
     #
     # Debugging configs.
     #
     TrainConfig(
         name="debug",
         data=FakeDataConfig(),
-        batch_size=2,
+        batch_size=4,
         model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,

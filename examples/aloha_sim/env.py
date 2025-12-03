@@ -62,12 +62,14 @@ class AlohaSimEnvironment(_environment.Environment):
 
     # 返回当前回合的累计奖励的最大值
     @override
-    def apply_action(self, action: dict) -> None:
-        # 将 OpenPI 的动作格式转换为 gym_aloha 所需的格式并执行动作     
+    def apply_action(self, action: dict) -> tuple[float, dict]:
+        # 将 OpenPI 的动作格式转换为 gym_aloha 所需的格式并执行动作
         gym_obs, reward, terminated, truncated, info = self._gym.step(action["actions"])
         self._last_obs = self._convert_observation(gym_obs)  # type: ignore
-        self._done = truncated # or terminated
-        self._episode_reward = max(self._episode_reward, reward)
+        self._done = truncated  # or terminated
+        # 累积奖励，便于 RL 统计；如果更合适取 max，可自行调整
+        self._episode_reward += reward
+        return reward, info
 
     def _convert_observation(self, gym_obs: dict) -> dict:
         # 从 gym_aloha 的观测构造 OpenPI 所需要的观测格式
