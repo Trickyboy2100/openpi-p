@@ -54,3 +54,86 @@ Timestamp: 2025-12-04T01:01:03+08:00
   - Avg length: 49.25
   - Env reward >0 fraction: ~0.2% of steps
 - Use this as the reference when evaluating RL fine-tuning gains.
+
+## Stage 2/3 Progress (2025-12-04)
+- Files touched:
+  - `examples/aloha_sim/rl_train_pi0_tiny.py`: residual REINFORCE head, JSON logging, profiling, contact-shaping flag, advantage normalization, Stage3 debug preset.
+  - `examples/aloha_sim/rl_loop.py`: reward shaping map, device debug prints, image shape fixes.
+  - `examples/aloha_sim/profile_policy.py`: per-stage profiling + device debug.
+  - `src/openpi/models/pi0.py`: extra image channel sanity (clip to 3 channels).
+- Profiling (single forward, tiny_b4, NHWC 224x224):
+  - sample_actions_dt ≈ 15–22s; inputs/tokenize/obs_build ~<0.2s. Bottleneck = model.sample_actions.
+- Reward shaping:
+  - Optional contact mapping 0..4 → [0, 0.2, 0.5, 1.0, 3.0] (enable via `--allow-contact-shaping`, default on).
+  - Advantage used in update: adv = (R - mean) / (std + 1e-6).
+- Debug presets:
+  - `--stage3-debug` sets episodes-per-iter=2, train-iters=5, max-episode-steps=20, gamma=0.97. Use for quick tiny experiments.
+  - JSON log via `--log-json` appends per-iter stats to `{"records": [...]}`.
+- Device sanity:
+  - Added `[jax-debug] devices=...` and sample_actions/base_policy tensor device prints in policy/profile/train scripts to confirm GPU usage.
+
+## Commands (Stage3 tiny debug example)
+```bash
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl XLA_PYTHON_CLIENT_PREALLOCATE=false \
+python examples/aloha_sim/rl_train_pi0_tiny.py \
+  --checkpoint checkpoints/pi0_aloha_sim_tiny_b4/aloha_sim_tiny_gpu_b4/199/params \
+  --config-name pi0_aloha_sim_tiny_b4 \
+  --stage3-debug \
+  --allow-contact-shaping \
+  --log-json outputs/rl_tiny_stage3_debug.json
+```
+Expect logs with `[jax-debug] devices=...`, per-iter train/eval stats, profiling line, and JSON records (batch_success_rate, eval success_rate, mean_policy_step_dt, etc.). Forward pass remains slow (~16–22s/step); success likely sparse unless reward signal improves.
+
+## Suggested command sequence (runnable, with purposes)
+1) **Profile policy forward (per-stage timing + device check)**  
+   Purpose: confirm images/device shape and measure inputs/tokenize/obs_build/sample_actions timings.  
+   ```bash
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+   python examples/aloha_sim/profile_policy.py \
+     --checkpoint checkpoints/pi0_aloha_sim_tiny_b4/aloha_sim_tiny_gpu_b4/199/params \
+     --config-name pi0_aloha_sim_tiny_b4 \
+     --iters 6 --warmup 1
+   ```  
+   Watch `[jax-debug] devices=...` and the timing summary; sample_actions is the bottleneck.
+
+2) **BC-only eval (Stage1 baseline re-run)**  
+   Purpose: reproduce baseline success rate/return on tiny_b4.  
+   ```bash
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl XLA_PYTHON_CLIENT_PREALLOCATE=false \
+   python examples/aloha_sim/eval_policy.py \
+     --checkpoint checkpoints/pi0_aloha_sim_tiny_b4/aloha_sim_tiny_gpu_b4/199/params \
+     --config-name pi0_aloha_sim_tiny_b4 \
+     --episodes 20 \
+     --max-episode-steps 50 \
+     --save-metrics outputs/tiny_b4_eval_20ep_50steps.json
+   ```
+
+3) **Analyze eval metrics (Stage1)**  
+   Purpose: summarize success/return stats, optional plots.  
+   ```bash
+   python examples/aloha_sim/analyze_eval_metrics.py \
+     --metrics outputs/tiny_b4_eval_20ep_50steps.json \
+     --plot
+   ```
+
+4) **Stage2/3 tiny debug RL run**  
+   Purpose: quick residual REINFORCE sanity check with contact shaping and JSON logging.  
+   ```bash
+   MUJOCO_GL=egl PYOPENGL_PLATFORM=egl XLA_PYTHON_CLIENT_PREALLOCATE=false \
+   python examples/aloha_sim/rl_train_pi0_tiny.py \
+     --checkpoint checkpoints/pi0_aloha_sim_tiny_b4/aloha_sim_tiny_gpu_b4/199/params \
+     --config-name pi0_aloha_sim_tiny_b4 \
+     --stage3-debug \
+     --allow-contact-shaping \
+     --log-json outputs/rl_tiny_stage3_debug.json
+   ```  
+   Check console `[train]/[eval]/[profile]` lines and JSON `records` for `batch_success_rate` / `eval success_rate`.
+
+# How to onboard a new Codex session
+
+1. cd ~/Gitclones/openpi
+2. source .venv/bin/activate
+3. Ask Codex to:
+   - read examples/aloha_sim/env.py, rl_loop.py, eval_policy.py, analyze_eval_metrics.py, rl_train_pi0_tiny.py
+   - read notes/aloha_pi_bc_eval_stage1.md
+4. Then continue Stage 2 RL experiments.

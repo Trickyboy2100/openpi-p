@@ -111,7 +111,15 @@ class Pi0(_model.BaseModel):
         tokens = []
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            img = obs.images[name]
+            # Ensure channel-last (NHWC); fix NCHW if encountered, otherwise fail fast.
+            if img.ndim == 4 and img.shape[-1] not in (1, 3) and img.shape[1] in (1, 3):
+                img = jnp.transpose(img, (0, 2, 3, 1))
+            if img.ndim >= 3 and img.shape[-1] not in (1, 3):
+                img = img[..., :3]
+            if img.shape[-1] not in (1, 3):
+                raise ValueError(f"[embed_prefix] Unexpected image shape for {name}: {img.shape}")
+            image_tokens, _ = self.PaliGemma.img(img, train=False)
 
             tokens.append(image_tokens)
             input_mask.append(

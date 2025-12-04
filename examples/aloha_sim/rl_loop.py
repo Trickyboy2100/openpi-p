@@ -48,12 +48,25 @@ def convert_env_obs(gym_obs: Dict[str, Any]) -> Dict[str, Any]:
         # fallback to first available
         top = next(iter(pixels.values()))
 
+    def ensure_chw(img: Any, cam_name: str) -> np.ndarray:
+        arr = np.asarray(img)
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            arr = arr[0]
+        # If HWC (channel last), move to CHW; if already CHW, keep; if 2D, add singleton channel.
+        if arr.ndim == 3 and arr.shape[-1] in (1, 3):
+            arr = np.transpose(arr, (2, 0, 1))
+        elif arr.ndim == 2:
+            arr = np.transpose(arr[..., None], (2, 0, 1))
+        if arr.ndim != 3 or arr.shape[0] not in (1, 3):
+            raise ValueError(f"[convert_env_obs] Unexpected image shape for {cam_name}: {arr.shape}")
+        return arr
+
     return {
         "state": np.asarray(state, dtype=np.float32),
         "images": {
-            "cam_high": np.asarray(top),  # [H,W,C] uint8
-            "cam_left_wrist": np.asarray(pixels.get("left_wrist", top)),
-            "cam_right_wrist": np.asarray(pixels.get("right_wrist", top)),
+            "cam_high": ensure_chw(top, "cam_high"),  # [C,H,W] uint8
+            "cam_left_wrist": ensure_chw(pixels.get("left_wrist", top), "cam_left_wrist"),
+            "cam_right_wrist": ensure_chw(pixels.get("right_wrist", top), "cam_right_wrist"),
         },
         "prompt": "Transfer cube",  # default prompt used in training
     }
@@ -70,25 +83,47 @@ def make_policy(checkpoint_path: str, config_name: str):
     inputs_tf = AlohaInputs(adapt_to_pi=True)
     outputs_tf = AlohaOutputs(adapt_to_pi=True)
     tokenizer = PaligemmaTokenizer(cfg.model.max_token_len)
+    cached_prompt: str | None = None
+    cached_tokens: jnp.ndarray | None = None
+    cached_mask: jnp.ndarray | None = None
 
     def tokenize_prompt(prompt: str, batch: int) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal cached_prompt, cached_tokens, cached_mask
+        if cached_prompt == prompt and cached_tokens is not None and cached_mask is not None:
+            return cached_tokens, cached_mask
         tokens, mask = tokenizer.tokenize(prompt)
         tokens = jnp.asarray(tokens, dtype=jnp.int32)[None, ...].repeat(batch, axis=0)
         mask = jnp.asarray(mask, dtype=bool)[None, ...].repeat(batch, axis=0)
+        cached_prompt, cached_tokens, cached_mask = prompt, tokens, mask
         return tokens, mask
+
+    first_device_log: list[bool] = [False]
 
     def policy_fn(obs_np: Dict[str, Any]) -> np.ndarray:
         data_in = inputs_tf(obs_np)  # maps to dict with image/state keys expected by model transforms
         batch = 1
         tok, tok_mask = tokenize_prompt(obs_np.get("prompt", ""), batch)
 
-        # Ensure images have batch dim
+        def ensure_nhwc(x: Any) -> np.ndarray:
+            arr = np.asarray(x)
+            if arr.ndim == 3:
+                if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+                    arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
+            elif arr.ndim == 4:
+                if arr.shape[-1] not in (1, 3) and arr.shape[1] in (1, 3):
+                    arr = np.transpose(arr, (0, 2, 3, 1))  # NCHW -> NHWC
+            if arr.ndim >= 3 and arr.shape[-1] not in (1, 3):
+                # Fallback: drop extra channels if shape exploded (e.g., [..., 224])
+                arr = arr[..., :3]
+            return arr
+
+        # Ensure images have batch dim and NHWC
         images = {}
         for k, v in data_in["image"].items():
-            arr = jnp.asarray(v)
+            arr = ensure_nhwc(v)
             if arr.ndim == 3:  # HWC
                 arr = arr[None, ...]
-            images[k] = arr
+            images[k] = jnp.asarray(arr)
 
         # Ensure image masks have batch dim and bool dtype
         image_mask = {}
@@ -119,7 +154,15 @@ def make_policy(checkpoint_path: str, config_name: str):
 
         rng = jax.random.key(int(time.time() * 1e6) & 0xFFFFFFFF)
         # Sample actions for full horizon; take first step.
-        actions = np.array(model.sample_actions(rng, observation))[0]
+        actions_jax = model.sample_actions(rng, observation)
+        if not first_device_log[0]:
+            try:
+                print(f"[jax-debug] policy devices={jax.devices()}")
+                print(f"[jax-debug] sample_actions device={actions_jax.device()}")
+            except Exception:
+                pass
+            first_device_log[0] = True
+        actions = np.array(actions_jax)[0]
         acted = outputs_tf({"actions": actions})["actions"][0]
         # Safety: clip/finite filter to avoid NaNs or huge torques.
         acted = np.nan_to_num(acted, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -129,7 +172,130 @@ def make_policy(checkpoint_path: str, config_name: str):
     return policy_fn
 
 
-def compute_reward(pi_obs: Dict[str, Any], info: Dict[str, Any], action: np.ndarray, env_reward: float = 0.0) -> float:
+def make_profiled_policy(checkpoint_path: str, config_name: str):
+    """Profiled variant of make_policy: returns fn(obs)->(action, timing_dict)."""
+    cfg = get_config(config_name or "pi0_aloha_sim_tiny_b4")
+    params_pure = _model.restore_params(checkpoint_path, restore_type=np.ndarray)
+    model = cfg.model.load(params_pure)
+    model.eval()
+
+    inputs_tf = AlohaInputs(adapt_to_pi=True)
+    outputs_tf = AlohaOutputs(adapt_to_pi=True)
+    tokenizer = PaligemmaTokenizer(cfg.model.max_token_len)
+    cached_prompt: str | None = None
+    cached_tokens: jnp.ndarray | None = None
+    cached_mask: jnp.ndarray | None = None
+
+    def tokenize_prompt(prompt: str, batch: int, profile: bool = False, timings: Dict[str, float] | None = None):
+        nonlocal cached_prompt, cached_tokens, cached_mask
+        t0 = time.perf_counter() if profile else 0.0
+        if cached_prompt == prompt and cached_tokens is not None and cached_mask is not None:
+            tokens, mask = cached_tokens, cached_mask
+        else:
+            tokens_np, mask_np = tokenizer.tokenize(prompt)
+            tokens = jnp.asarray(tokens_np, dtype=jnp.int32)[None, ...].repeat(batch, axis=0)
+            mask = jnp.asarray(mask_np, dtype=bool)[None, ...].repeat(batch, axis=0)
+            cached_prompt, cached_tokens, cached_mask = prompt, tokens, mask
+        if profile and timings is not None:
+            timings["tokenize_dt"] = time.perf_counter() - t0
+        return tokens, mask
+
+    printed_shape = False
+
+    def build_observation(obs_np: Dict[str, Any], profile: bool = False) -> tuple[_model.Observation, Dict[str, float]]:
+        timings: Dict[str, float] = {}
+        t0 = time.perf_counter() if profile else 0.0
+        data_in = inputs_tf(obs_np)
+        if profile:
+            timings["inputs_dt"] = time.perf_counter() - t0
+        batch = 1
+        tok, tok_mask = tokenize_prompt(obs_np.get("prompt", ""), batch, profile=profile, timings=timings)
+
+        def ensure_nhwc(x: Any) -> np.ndarray:
+            arr = np.asarray(x)
+            if arr.ndim == 3:
+                if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+                    arr = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
+            elif arr.ndim == 4:
+                if arr.shape[-1] not in (1, 3) and arr.shape[1] in (1, 3):
+                    arr = np.transpose(arr, (0, 2, 3, 1))  # NCHW -> NHWC
+            return arr
+
+        images = {}
+        for k, v in data_in["image"].items():
+            arr = ensure_nhwc(v)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            images[k] = jnp.asarray(arr)
+
+        image_mask = {}
+        for k, v in data_in["image_mask"].items():
+            arr = jnp.asarray(v, dtype=bool)
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
+            if arr.shape[0] != batch:
+                arr = np.broadcast_to(arr.reshape(1), (batch,))
+            image_mask[k] = arr
+
+        state_arr = jnp.asarray(data_in["state"], dtype=jnp.float32)
+        if state_arr.ndim == 1:
+            state_arr = state_arr[None, ...]
+        pad_dim = cfg.model.action_dim - state_arr.shape[-1]
+        if pad_dim > 0:
+            state_arr = jnp.pad(state_arr, ((0, 0), (0, pad_dim)), mode="constant")
+        elif pad_dim < 0:
+            state_arr = state_arr[..., : cfg.model.action_dim]
+        data_dict = {
+            "image": images,
+            "image_mask": image_mask,
+            "state": state_arr,
+            "tokenized_prompt": tok,
+            "tokenized_prompt_mask": tok_mask,
+        }
+        t_obs = time.perf_counter() if profile else 0.0
+        observation = _model.Observation.from_dict(data_dict)
+        nonlocal printed_shape
+        if not printed_shape:
+            printed_shape = True
+            for k, v in images.items():
+                print(f"[debug] data_in image {k} shape {v.shape}")
+        if profile:
+            timings["obs_build_dt"] = time.perf_counter() - t_obs
+        return observation, timings
+
+    first_device_log: list[bool] = [False]
+
+    def profiled_policy_fn(obs_np: Dict[str, Any]) -> tuple[np.ndarray, Dict[str, float]]:
+        total_start = time.perf_counter()
+        observation, timings = build_observation(obs_np, profile=True)
+        rng = jax.random.key(int(time.time() * 1e6) & 0xFFFFFFFF)
+        t_sample = time.perf_counter()
+        actions_jax = model.sample_actions(rng, observation)
+        if not first_device_log[0]:
+            try:
+                print(f"[jax-debug] policy devices={jax.devices()}")
+                print(f"[jax-debug] sample_actions device={actions_jax.device()}")
+            except Exception:
+                pass
+            first_device_log[0] = True
+        actions = np.array(actions_jax)[0]
+        timings["sample_actions_dt"] = time.perf_counter() - t_sample
+        acted = outputs_tf({"actions": actions})["actions"][0]
+        acted = np.nan_to_num(acted, nan=0.0, posinf=1.0, neginf=-1.0)
+        acted = np.clip(acted, -0.5, 0.5)
+        timings["total_dt"] = time.perf_counter() - total_start
+        return acted, timings
+
+    return profiled_policy_fn
+
+
+def compute_reward(
+    pi_obs: Dict[str, Any],
+    info: Dict[str, Any],
+    action: np.ndarray,
+    env_reward: float = 0.0,
+    allow_contact_shaping: bool = True,
+) -> float:
     """Task-aware reward placeholder (Stage 1).
 
     If env exposes task info (e.g., cube/goal positions or success flags), use them here.
@@ -140,7 +306,12 @@ def compute_reward(pi_obs: Dict[str, Any], info: Dict[str, Any], action: np.ndar
     """
     dist_term = -float(np.linalg.norm(pi_obs["state"])) * 0.1  # mild shaping; adjust as needed
     act_pen = -float(np.linalg.norm(action)) * 0.01
-    env_term = float(env_reward)  # use env's discrete reward directly
+    if allow_contact_shaping:
+        contact_map = [0.0, 0.2, 0.5, 1.0, 3.0]
+        env_idx = int(np.clip(env_reward, 0, len(contact_map) - 1))
+        env_term = float(contact_map[env_idx])
+    else:
+        env_term = float(env_reward)  # use env's discrete reward directly
     success_bonus = 0.0
     if info is not None:
         for k in ("success", "is_success", "done_success"):

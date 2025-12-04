@@ -79,14 +79,12 @@ class AlohaSimEnvironment(_environment.Environment):
         img = gym_obs["pixels"]["top"]
         # Resize and convert image to uint8
         img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, 224, 224))
-        # Convert axis order from [H, W, C] --> [C, H, W]
-        # [C, H, W]分别代表 通道、高度、宽度
-        # 两者不统一的原因是 PyTorch 和 TensorFlow 对图像数据的默认格式不同
-        img = np.transpose(img, (2, 0, 1))
-
-        # 返回包含状态和图像的观测字典
-        # python字典的键值对顺序是无序的
-        # 这里我们返回的字典包含两个键："state" 和 "images"
+        # Ensure HWC layout for downstream policy (if channel-first, transpose)
+        if img.ndim == 3 and img.shape[-1] != 3 and img.shape[0] in (1, 3):
+            img = np.transpose(img, (1, 2, 0))
+        if img.ndim != 3 or img.shape[-1] not in (1, 3):
+            raise ValueError(f"Unexpected image shape after resize: {img.shape}")
+        # 保持 HWC 格式，后续 convert_env_obs 期望 HWC
         return {
             "state": gym_obs["agent_pos"],
             "images": {"cam_high": img},
