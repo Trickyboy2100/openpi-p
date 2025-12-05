@@ -20,6 +20,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict
+import time
 
 import numpy as np
 
@@ -97,8 +98,10 @@ def plot_metrics(data: Dict[str, Any], out_dir: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
     base = Path(data.get("config", {}).get("checkpoint", "metrics")).stem
+    out_dir = out_dir / f"{ts}_{base}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     def save_hist(arr_list, title, fname, bins=30):
         arr = np.asarray(arr_list, dtype=np.float64)
@@ -114,12 +117,12 @@ def plot_metrics(data: Dict[str, Any], out_dir: Path) -> None:
         plt.savefig(out_dir / fname)
         plt.close()
 
-    save_hist(data.get("returns", []), "Per-episode returns", f"{base}_returns_hist.png")
+    save_hist(data.get("returns", []), "Per-episode returns", f"{ts}_returns_hist_{base}.png")
     # flatten per-step rewards
     env_rewards = [r for ep in data.get("env_rewards", []) for r in ep]
     shaped_rewards = [r for ep in data.get("shaped_rewards", []) for r in ep]
-    save_hist(env_rewards, "Per-step env rewards", f"{base}_env_rewards_hist.png")
-    save_hist(shaped_rewards, "Per-step shaped rewards", f"{base}_shaped_rewards_hist.png")
+    save_hist(env_rewards, "Per-step env rewards", f"{ts}_env_rewards_hist_{base}.png")
+    save_hist(shaped_rewards, "Per-step shaped rewards", f"{ts}_shaped_rewards_hist_{base}.png")
 
 
 def main() -> None:

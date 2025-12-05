@@ -4,6 +4,7 @@ import numpy as np
 from openpi_client import image_tools
 from openpi_client.runtime import environment as _environment
 from typing_extensions import override
+from gym_aloha.env import BOX_POSE  # access sampled cube init pose for goal placeholder
 
 
 class AlohaSimEnvironment(_environment.Environment):
@@ -29,6 +30,7 @@ class AlohaSimEnvironment(_environment.Environment):
     ) -> None:
         np.random.seed(seed)
         self._rng = np.random.default_rng(seed)
+        self._cube_goal_pos = None  # placeholder for cube goal (from BOX_POSE start pose)
 
         self._gym = gymnasium.make(
             task,
@@ -45,6 +47,9 @@ class AlohaSimEnvironment(_environment.Environment):
     @override
     def reset(self) -> None:
         gym_obs, _ = self._gym.reset(seed=int(self._rng.integers(2**32 - 1)))
+        # Capture goal pose from BOX_POSE sampled during gym_aloha reset (pos+quat, take position)
+        if BOX_POSE[0] is not None:
+            self._cube_goal_pos = np.asarray(BOX_POSE[0])[:3]
         self._last_obs = self._convert_observation(gym_obs)  # type: ignore
         self._done = False
         self._episode_reward = 0.0
@@ -71,6 +76,9 @@ class AlohaSimEnvironment(_environment.Environment):
         self._done = bool(truncated) or bool(terminated) or bool(is_success)
         # 累积奖励，便于 RL 统计；如果更合适取 max，可自行调整
         self._episode_reward += reward
+        info = info or {}
+        if self._cube_goal_pos is not None:
+            info["cube_goal_pos"] = self._cube_goal_pos
         return reward, info
 
     def _convert_observation(self, gym_obs: dict) -> dict:
@@ -84,8 +92,19 @@ class AlohaSimEnvironment(_environment.Environment):
             img = np.transpose(img, (1, 2, 0))
         if img.ndim != 3 or img.shape[-1] not in (1, 3):
             raise ValueError(f"Unexpected image shape after resize: {img.shape}")
+        cube_pos = None
+        # gym_aloha TransferCube exposes env_state = qpos[16:], where the first 7 entries are box pose (pos+quat).
+        if "env_state" in gym_obs:
+            env_state = np.asarray(gym_obs["env_state"])
+            if env_state.size >= 7:
+                cube_pos = env_state[:7]
         # 保持 HWC 格式，后续 convert_env_obs 期望 HWC
-        return {
+        obs_out = {
             "state": gym_obs["agent_pos"],
             "images": {"cam_high": img},
         }
+        if cube_pos is not None:
+            obs_out["cube_pos"] = cube_pos
+        if self._cube_goal_pos is not None:
+            obs_out["cube_goal_pos"] = self._cube_goal_pos
+        return obs_out

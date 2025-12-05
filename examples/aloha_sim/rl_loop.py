@@ -61,7 +61,7 @@ def convert_env_obs(gym_obs: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"[convert_env_obs] Unexpected image shape for {cam_name}: {arr.shape}")
         return arr
 
-    return {
+    obs_out = {
         "state": np.asarray(state, dtype=np.float32),
         "images": {
             "cam_high": ensure_chw(top, "cam_high"),  # [C,H,W] uint8
@@ -70,6 +70,9 @@ def convert_env_obs(gym_obs: Dict[str, Any]) -> Dict[str, Any]:
         },
         "prompt": "Transfer cube",  # default prompt used in training
     }
+    if "cube_pos" in gym_obs:
+        obs_out["cube_pos"] = np.asarray(gym_obs["cube_pos"], dtype=np.float32)
+    return obs_out
 
 
 def make_policy(checkpoint_path: str, config_name: str):
@@ -295,6 +298,7 @@ def compute_reward(
     action: np.ndarray,
     env_reward: float = 0.0,
     allow_contact_shaping: bool = True,
+    cube_dist_lambda: float = 0.0,
 ) -> float:
     """Task-aware reward placeholder (Stage 1).
 
@@ -312,6 +316,22 @@ def compute_reward(
         env_term = float(contact_map[env_idx])
     else:
         env_term = float(env_reward)  # use env's discrete reward directly
+    # Optional distance shaping on cube pose (pos+quat first 7 dims). TODO: wire actual goal from env/info.
+    cube_shaping = 0.0
+    cube_dist = None
+    if cube_dist_lambda > 0 and "cube_pos" in pi_obs:
+        cube_pos = np.asarray(pi_obs["cube_pos"], dtype=np.float32)
+        cube_goal = None
+        # TODO: populate cube_goal from env/info if available.
+        if info and "cube_goal" in info:
+            cube_goal = np.asarray(info["cube_goal"], dtype=np.float32)
+        elif info and "cube_goal_pos" in info:
+            cube_goal = np.asarray(info["cube_goal_pos"], dtype=np.float32)
+        # Fallback: zero goal placeholder.
+        if cube_goal is None:
+            cube_goal = np.zeros_like(cube_pos)
+        cube_dist = float(np.linalg.norm(cube_pos - cube_goal))
+        cube_shaping = -cube_dist_lambda * cube_dist
     success_bonus = 0.0
     if info is not None:
         for k in ("success", "is_success", "done_success"):
@@ -321,7 +341,19 @@ def compute_reward(
         # If env later provides a distance metric, add it here:
         if "dist_to_goal" in info:
             dist_term = -float(info["dist_to_goal"])
-    return env_term + dist_term + act_pen + success_bonus
+    reward_components = {
+        "env_term": env_term,
+        "dist_term": dist_term,
+        "act_pen": act_pen,
+        "success_bonus": success_bonus,
+        "cube_shaping": cube_shaping,
+    }
+    if cube_dist is not None:
+        reward_components["cube_dist"] = cube_dist
+    # Optionally attach to info for downstream logging.
+    if info is not None:
+        info.setdefault("reward_components", reward_components)
+    return env_term + dist_term + act_pen + success_bonus + cube_shaping
 
 
 def rollout(env: AlohaSimEnvironment, policy_fn, episode_steps: int = 200) -> float:

@@ -64,14 +64,15 @@ class Trajectory:
     success: bool
     policy_dt: float
     env_dt: float
+    cube_dists: List[float]
 
 
-def init_head_params(state_dim: int, action_dim: int, key: jax.random.PRNGKey) -> Dict[str, jnp.ndarray]:
+def init_head_params(state_dim: int, action_dim: int, key: jax.random.PRNGKey, residual_std: float) -> Dict[str, jnp.ndarray]:
     """Tiny residual head: mean = base_action + state @ W + b; log_std is a scalar."""
     k1, k2 = jax.random.split(key)
     w = jax.random.normal(k1, (state_dim, action_dim)) * 0.01
     b = jnp.zeros((action_dim,))
-    log_std = jnp.array(-1.0)  # std ~ 0.37
+    log_std = jnp.log(jnp.array(residual_std))
     return {"w": w, "b": b, "log_std": log_std}
 
 
@@ -80,8 +81,12 @@ def policy_with_head(
     state: jnp.ndarray,
     params: Dict[str, jnp.ndarray],
     key: jax.random.PRNGKey,
+    disable_residual: bool,
 ) -> Tuple[jnp.ndarray, float]:
     """Compute final action and logprob under Gaussian residual head."""
+    if disable_residual:
+        # Residual disabled: return base_action directly, logprob placeholder 0.
+        return jnp.clip(base_action, -0.5, 0.5), 0.0
     residual_mean = state @ params["w"] + params["b"]
     mean = base_action + residual_mean
     std = jnp.exp(params["log_std"])
@@ -101,6 +106,8 @@ def collect_trajectory(
     max_steps: int,
     rng: jax.random.PRNGKey,
     allow_contact_shaping: bool,
+    cube_dist_lambda: float,
+    disable_residual: bool,
 ) -> Tuple[Trajectory, jax.random.PRNGKey]:
     """Collect one episode using current policy (base + residual head)."""
     env.reset()
@@ -113,6 +120,7 @@ def collect_trajectory(
     success = False
     policy_time = 0.0
     env_time = 0.0
+    cube_dists = []
     for t in range(max_steps):
         rng, k1 = jax.random.split(rng)
         obs = env.get_observation()
@@ -125,17 +133,28 @@ def collect_trajectory(
         if state_vec.ndim == 1:
             state_vec = state_vec[None, ...]
         state_vec = state_vec[0]  # (S,)
-        action, logp = policy_with_head(base_action, state_vec, head_params, k1)
+        action, logp = policy_with_head(base_action, state_vec, head_params, k1, disable_residual)
         t1 = time.perf_counter()
         env_r, info = env.apply_action({"actions": np.array(action)})
         env_time += time.perf_counter() - t1
-        r = compute_reward(pi_obs, info or {}, np.array(action), env_reward=env_r, allow_contact_shaping=allow_contact_shaping)
+        r = compute_reward(
+            pi_obs,
+            info or {},
+            np.array(action),
+            env_reward=env_r,
+            allow_contact_shaping=allow_contact_shaping,
+            cube_dist_lambda=cube_dist_lambda,
+        )
         rewards.append(r)
         env_rewards.append(env_r)
         actions.append(np.array(action))
         log_probs.append(float(logp))
         observations.append(pi_obs)
-        infos.append(info or {})
+        info_safe = info or {}
+        infos.append(info_safe)
+        rc = (info_safe or {}).get("reward_components")
+        if rc and "cube_dist" in rc:
+            cube_dists.append(float(rc["cube_dist"]))
         if info and any(info.get(k, False) for k in ("success", "is_success", "done_success")):
             success = True
         if env.is_episode_complete():
@@ -153,6 +172,7 @@ def collect_trajectory(
         success=success,
         policy_dt=policy_time,
         env_dt=env_time,
+        cube_dists=cube_dists,
     )
     return traj, rng
 
@@ -165,10 +185,14 @@ def collect_batch(
     max_steps: int,
     rng: jax.random.PRNGKey,
     allow_contact_shaping: bool,
+    cube_dist_lambda: float,
+    disable_residual: bool,
 ) -> Tuple[List[Trajectory], jax.random.PRNGKey]:
     batch = []
     for ep in range(episodes):
-        traj, rng = collect_trajectory(env, base_policy_fn, head_params, max_steps, rng, allow_contact_shaping)
+        traj, rng = collect_trajectory(
+            env, base_policy_fn, head_params, max_steps, rng, allow_contact_shaping, cube_dist_lambda, disable_residual
+        )
         batch.append(traj)
         print(
             f"[{datetime.now().isoformat()}][collect] ep={ep} return={traj.returns[0]:.3f} "
@@ -235,13 +259,17 @@ def evaluate(
     max_steps: int,
     rng: jax.random.PRNGKey,
     allow_contact_shaping: bool,
+    cube_dist_lambda: float,
+    disable_residual: bool,
 ) -> Tuple[Dict[str, float], jax.random.PRNGKey]:
     """Lightweight eval: success rate, avg env_reward, avg shaped return."""
     successes = []
     env_returns = []
     shaped_returns = []
     for ep in range(episodes):
-        traj, rng = collect_trajectory(env, base_policy_fn, head_params, max_steps, rng, allow_contact_shaping)
+        traj, rng = collect_trajectory(
+            env, base_policy_fn, head_params, max_steps, rng, allow_contact_shaping, cube_dist_lambda, disable_residual
+        )
         successes.append(traj.success)
         env_returns.append(float(np.sum(traj.env_rewards)))
         shaped_returns.append(traj.returns[0])
@@ -266,6 +294,9 @@ def main() -> None:
     parser.add_argument("--log-json", type=str, default="", help="Optional path to append per-iter JSON logs.")
     parser.add_argument("--allow-contact-shaping", action="store_true", default=True, help="Enable contact-based reward shaping.")
     parser.add_argument("--stage3-debug", action="store_true", help="Use Stage3 tiny debug defaults (episodes-per-iter=2, train-iters=5, max-episode-steps=20, gamma=0.97).")
+    parser.add_argument("--cube-dist-lambda", type=float, default=0.0, help="Weight for cube position distance shaping term.")
+    parser.add_argument("--residual-std", type=float, default=0.02, help="Std for residual Gaussian noise.")
+    parser.add_argument("--disable-residual", action="store_true", help="If set, ignore residual head (use base policy only).")
     args = parser.parse_args()
 
     if args.stage3_debug:
@@ -298,7 +329,7 @@ def main() -> None:
     # state is padded to action_dim (=32) in preprocessing
     state_dim = action_dim
     rng = jax.random.PRNGKey(0)
-    head_params = init_head_params(state_dim, action_dim, rng)
+    head_params = init_head_params(state_dim, action_dim, rng, args.residual_std)
     optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(head_params)
 
@@ -314,6 +345,8 @@ def main() -> None:
             args.max_episode_steps,
             rng,
             args.allow_contact_shaping,
+            args.cube_dist_lambda,
+            args.disable_residual,
         )
         batch = prepare_batch(trajs, gamma=args.gamma)
         head_params, opt_state, loss = update_policy(head_params, optimizer, opt_state, batch)
@@ -325,6 +358,8 @@ def main() -> None:
             args.max_episode_steps,
             rng,
             args.allow_contact_shaping,
+            args.cube_dist_lambda,
+            args.disable_residual,
         )
         total_steps = np.sum([len(t.rewards) for t in trajs]) or 1
         mean_policy_dt = np.sum([t.policy_dt for t in trajs]) / total_steps
@@ -337,7 +372,10 @@ def main() -> None:
             f"avg_len={np.mean([len(t.rewards) for t in trajs]):.2f} "
             f"avg_env_r={avg_env_r:.3f} "
             f"avg_shaped_ret={avg_shaped_ret:.3f} "
-            f"success_rate_batch={success_rate_batch:.3f}"
+            f"success_rate_batch={success_rate_batch:.3f} "
+            f"cube_lambda={args.cube_dist_lambda} "
+            f"residual_std={args.residual_std} "
+            f"disable_residual={args.disable_residual}"
         )
         print(f"[{datetime.now().isoformat()}][eval] iter={it} stats={eval_stats}")
         print(
@@ -353,6 +391,9 @@ def main() -> None:
                 "eval_stats": eval_stats,
                 "mean_policy_step_dt": mean_policy_dt,
                 "mean_env_step_dt": mean_env_dt,
+                "cube_dist_lambda": args.cube_dist_lambda,
+                "residual_std": args.residual_std,
+                "disable_residual": args.disable_residual,
             }
             if log_path.exists():
                 with log_path.open("r") as f:
